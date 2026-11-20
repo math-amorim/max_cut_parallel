@@ -1,19 +1,19 @@
 #include <bits/stdc++.h>
 #include <mpi.h>
 #include <chrono>
+#include <omp.h>
 using namespace std; 
 using namespace chrono;
 #define p pair<int,int> 
 
-int S = 10000;
-double tempo = 1;
+double LIMITE_TEMPO = 85.0;
 
 int calculoValorCorte (vector<vector<p>>&matriz, vector<int>&grupos, int n) { 
     int corte = 0;
 
     for(int u = 1; u <= n; u++) {
         for(auto v : matriz[u]) 
-            if(u < v.first && grupos[u] != grupos[v.first])  corte += v.second;
+            if(u < v.first && grupos[u] != grupos[v.first]) corte += v.second;
     }
 
     return corte;
@@ -30,8 +30,9 @@ int calcularDelta (vector<vector<p>>&matriz, vector<int>&grupos, int i) {
     return delta;
 }
 
-void trocaGrupo(int i, vector<int>& grupos, vector<int>& delta, int& corte) {
+void trocaGrupo(int i, vector<int>& grupos, vector<int>& delta, int& corte) {    
     // adiciono o ganho ou a perda ao meu corte
+    #pragma omp atomic update
     corte += delta[i];
 
     // inverto o grupo 
@@ -45,131 +46,141 @@ void trocaGrupo(int i, vector<int>& grupos, vector<int>& delta, int& corte) {
 void gravarResultado(string arquivoSaida, string resultado) { 
     ofstream arquivo(arquivoSaida); 
 
-    if(arquivo.is_open()) { 
-        arquivo << resultado << endl;
-    } else cout << "Não foi possível abrir o arquivo." << endl;
+    if(arquivo.is_open()) arquivo << resultado << endl;
+    else cout << "Não foi possível abrir o arquivo." << endl;
 }
 
-void comunicacaoMPI (int rank, int processos, int fase, vector<vector<p>>& matriz, int n, vector<int>& grupos, vector<int>& delta, int& corte, int& melhorCorte, vector<int>& melhorGrupos, double T, vector<double>& temperaturas) { 
-    int vizinho = -1; 
+void trocaTemperatura (int processos, int fase, int& idxTemperatura, double& T, int corte, const vector<double>&temperaturas, long long& tentativas, long long& aceitas, mt19937& rng) { 
 
-    // vejo quem vou ver nessa fase 
-    if (fase == 0) vizinho = (rank % 2 == 0) ? rank + 1 : rank - 1; 
-    else vizinho = (rank % 2 == 0) ? rank - 1 : rank + 1;
+    vector<int> indices(processos);
 
-    // vejo se vizinha é valido 
-    if (vizinho < 0 or vizinho >= processos) return;
-    
-    // troco valor corte
-    int corteVizinho = 0;
+    MPI_Allgather(&idxTemperatura, 1, MPI_INT, indices.data(), 1, MPI_INT, MPI_COMM_WORLD);
 
-    MPI_Sendrecv(&corte, 1, MPI_INT, vizinho, 0, &corteVizinho, 1, MPI_INT, vizinho, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    int idxVizinho; 
 
-    // processo c rank menor faz a decisão 
+    if (idxTemperatura % 2 == fase) idxVizinho = idxTemperatura + 1;
+    else idxVizinho = idxTemperatura - 1;
+
+    if (idxVizinho < 0 or idxVizinho >= processos) return;
+
+    int vizinho = -1;
+
+    for (int r = 0; r < processos; r++) {
+        if (indices[r] == idxVizinho) {
+            vizinho = r;
+            break;
+        }
+    }
+
+    int idxVizinhoRecebido;
+
+    MPI_Sendrecv(&idxTemperatura, 1, MPI_INT, vizinho, 0, &idxVizinhoRecebido, 1, MPI_INT, vizinho, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    int corteVizinho;
+
+    MPI_Sendrecv(&corte, 1, MPI_INT, vizinho, 1, &corteVizinho, 1, MPI_INT, vizinho, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
     int decisao = 0;
 
-    if (rank < vizinho) { 
-        double expoente = (1.0 / T - 1.0 / temperaturas[vizinho]) * (corteVizinho - corte);
-        
-        double probabilidade = min(1.0, exp(expoente));
+    if (idxTemperatura < idxVizinhoRecebido) { 
+        double TA = temperaturas[idxTemperatura];
+        double TB = temperaturas[idxVizinho];
 
-        double sorteio = (double)rand() / (RAND_MAX + 1.0);
+        double expoente = (1.0 / TA - 1.0 / TB) * (corteVizinho - corte);
 
-        decisao = sorteio < probabilidade;
+        double probabilidade = (expoente >= 0.0) ? 1.0 : exp(expoente);
+
+        uniform_real_distribution<double> dist(0.0, 1.0);
+
+        decisao = (dist(rng) < probabilidade);
+
+        tentativas++;
+        if (decisao) aceitas++;
     }
 
-    int decisaoRecebida = 0; 
+    int decisaoRecebida = 0;
 
-    MPI_Sendrecv(&decisao, 1, MPI_INT, vizinho, 1, &decisaoRecebida, 1, MPI_INT, vizinho, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    MPI_Sendrecv(&decisao, 1, MPI_INT, vizinho, 2, &decisaoRecebida, 1, MPI_INT, vizinho, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-    // processo de maior rank receb decisao 
+    if (idxTemperatura > idxVizinhoRecebido) decisao = decisaoRecebida;
 
-    if (rank > vizinho) decisao = decisaoRecebida;
+    if (decisao) idxTemperatura = idxVizinho, T = temperaturas[idxTemperatura];
+} 
 
+vector<vector<int>> colorirGrafo(vector<vector<p>>&matriz, int n) { 
+    vector<int> cor(n+1, -1);
+    vector<int> marcadas(n+1, -1); 
+    vector<vector<int>> cores;
 
-    if (decisao) { 
-        vector<int> gruposVizinho(n + 1);
+    for (int i = 1; i <= n; i++) { 
+        for (auto v : matriz[i]) { 
+            int vizinho = v.first; 
+            if(cor[vizinho] != -1) marcadas[cor[vizinho]] = i;
+        }
 
-        MPI_Sendrecv(grupos.data(), n + 1, MPI_INT, vizinho, 2, gruposVizinho.data(), n + 1, MPI_INT, vizinho, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        int c = 0; 
 
-        // atualizo meu corte e grupos
-        corte = corteVizinho;
-        grupos.swap(gruposVizinho);
+        while (marcadas[c] == i) c++;
 
-        for (int i = 1; i <= n; i++) delta[i] = calcularDelta(matriz, grupos, i);
+        cor[i] = c; 
 
-        if (corte > melhorCorte) melhorCorte = corte, melhorGrupos = grupos;
+        if (c >= (int) cores.size()) cores.resize(c + 1);
 
+        cores[c].push_back(i);
     }
-  /*  if (rank < vizinho) {
-        cout << "Troca entre ranks " << rank << " e " << vizinho
-             << " | cortes: " << corte << " / " << corteVizinho
-             << " | aceita: " << decisao << endl;
-    }
-*/
+
+    return cores;
 }
 
-void trocaTemperatura(int processos, int fase, int& idx, double& T, int corte,
-                      const vector<double>& escada,
-                      vector<long long>& tent, vector<long long>& ace,
-                      mt19937& rng) {
-    // todos participam (coletiva): descobre quem tem cada temperatura
-    vector<int> idxDe(processos), quem(processos);
-    MPI_Allgather(&idx, 1, MPI_INT, idxDe.data(), 1, MPI_INT, MPI_COMM_WORLD);
-    for (int r = 0; r < processos; r++) quem[idxDe[r]] = r;
+mt19937 criarGerador(uint64_t seedBase, int rank, int finalidade, int thread = 0) {
+    seed_seq sequencia {
+        (uint32_t)seedBase,
+        (uint32_t)(seedBase >> 32),
+        (uint32_t)rank,
+        (uint32_t)finalidade,
+        (uint32_t)thread
+    };
 
-    // pares de índices: fase 0 -> (0,1)(2,3) ; fase 1 -> (1,2)
-    int idxViz = (idx % 2 == fase) ? idx + 1 : idx - 1;
-    if (idxViz < 0 || idxViz >= processos) return;
-    int vizinho = quem[idxViz];
-
-    int corteViz;
-    MPI_Sendrecv(&corte, 1, MPI_INT, vizinho, 0,
-                 &corteViz, 1, MPI_INT, vizinho, 0,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-    // quem tem a temperatura mais fria decide
-    int decisao = 0;
-    if (idx < idxViz) {
-        double expoente = (1.0 / escada[idx] - 1.0 / escada[idxViz]) * (corteViz - corte);
-        double prob = expoente >= 0 ? 1.0 : exp(expoente);
-        decisao = uniform_real_distribution<double>(0.0, 1.0)(rng) < prob;
-        tent[idx]++;
-        if (decisao) ace[idx]++;
-    }
-
-    int recebida = 0;
-    MPI_Sendrecv(&decisao, 1, MPI_INT, vizinho, 1,
-                 &recebida, 1, MPI_INT, vizinho, 1,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    if (idx > idxViz) decisao = recebida;
-
-    if (decisao) {       // só troca a temperatura, grupos e delta continuam válidos
-        idx = idxViz;
-        T = escada[idx];
-    }
+    return mt19937(sequencia);
 }
 
 int main (int argc, char* argv[]) {
-    MPI_Init(&argc, &argv);
+    int fornecido;
 
+    MPI_Init_thread(
+        &argc,
+        &argv,
+        MPI_THREAD_FUNNELED,
+        &fornecido
+    );
+
+    if (fornecido < MPI_THREAD_FUNNELED) MPI_Abort(MPI_COMM_WORLD, 1);
+    
     int rank, processos;
 
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &processos);
 
-    vector<double> temperaturas = {0.35, 0.45, 0.57, 0.7};    
-    if (processos != 4) { 
-        if (rank == 0) cout << "O programa precisa ser executado com 4 processos." << endl;
+    uint64_t seed = 0; 
 
-        MPI_Finalize();
-        return 1;
-    }
+    random_device rd; 
+    seed = ((uint64_t) rd() << 32) ^ rd(); 
+    seed ^= (uint64_t)steady_clock::now().time_since_epoch().count();
 
-    double T = temperaturas[rank];
 
+    MPI_Bcast(&seed, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+
+    vector<double> temperaturas = {0.40, 0.70, 1.00, 1.61};
+    
+    int idxTemperatura = rank; 
+    double T = temperaturas[idxTemperatura];
+
+    long long tentativas = 0, aceitas = 0;
+    
+    mt19937 rng = criarGerador(seed, rank, 0);
+
+    MPI_Barrier(MPI_COMM_WORLD);
     auto inicio = steady_clock::now();
-    //double t = clock(), now;
     
     if (argc < 3) { 
         cout << "Uso é : ./programa <arquivo_entrada> <arquivo_saida>" << endl;
@@ -203,111 +214,138 @@ int main (int argc, char* argv[]) {
         matriz[v].emplace_back(u,x);
     }
     arquivo.close();
-    srand(time(nullptr) + rank);
+
+    vector<vector<int>> cores = colorirGrafo(matriz, n);
+
+    mt19937 rngGrupos = criarGerador(seed, rank, 1); 
+
+    uniform_int_distribution<int> distGrupo(0,1);
 
     // aqui a gente separa em grupos aleatorios 
     vector<int> grupos(n+1);
-  
-    for(int i = 0; i < n + 1; i++) grupos[i] = rand() % 2;
+    for(int i = 0; i < n + 1; i++) grupos[i] = distGrupo(rngGrupos);
     
     // aq calcula o valor do corte inicial   
     int corte = calculoValorCorte(matriz, grupos, n);  
-        
+
     int melhorCorte = corte;
     vector<int> melhorGrupos = grupos; 
 
     // aq calcula o delta de cada vertice 
     vector<int> delta(n + 1);
-
     for(int i = 1; i <= n; i++) delta[i] = calcularDelta(matriz, grupos, i);
+
+    // inicializa thread
+    int numThreads = omp_get_max_threads();
+
+    vector<vector<int>> negativosPorThread(numThreads); 
+    vector<mt19937> geradores(numThreads);
+
+    for (int i = 0; i < numThreads; i++) geradores[i] = criarGerador(seed, rank, 2, i);
+
+    int fase = 0, s = 0, continuar = 1;
     
-    int fase = 0;
     // annealing 
-    for(int s = 0; s < 100000; s++) {
-        auto agora = steady_clock::now();
-        double now = duration_cast<duration<double>>(agora - inicio).count();
-        //now = (clock() - t) / CLOCKS_PER_SEC;
+    #pragma omp parallel
+    { 
+        while (continuar) {        
+            int tid = omp_get_thread_num(); 
+            uniform_real_distribution<double> dist(0.0, 1.0);
 
-//        if(now >= tempo) break;
-        
-        for(int i = 1; i <= n; i++) {
-            if (i % 1000 == 0) { 
-                agora = steady_clock::now();
-                now = duration_cast<duration<double>>(agora - inicio).count();
-  //              if (now >= tempo) break;
-            }
-            
-            if(delta[i] >= 0 or (double)rand() / RAND_MAX < exp(delta[i] / T)) {
-                for(auto v : matriz[i]) {
-                    int j = v.first;
-                    int peso = v.second;
+            for (int c = 0; c < (int)cores.size(); c++) { 
+                #pragma omp for schedule(static)
+                for (int k = 0; k < (int)cores[c].size(); k++) { 
+                    int i = cores[c][k]; 
 
-                    if(grupos[i] != grupos[j]) delta[j] += 2 * peso;
-                    else delta[j] -= 2 * peso;   
+                    if(delta[i] >= 0 or dist(geradores[tid]) < exp(delta[i] / T)) {
+                        if (delta[i] < 0) negativosPorThread[tid].push_back(i);
+                        
+                        for(auto v : matriz[i]) {
+                            int j = v.first;
+                            int peso = v.second;
+
+                            int valor;
+                            if(grupos[i] != grupos[j]) valor = 2 * peso;
+                            else valor = -2 * peso;
+                            
+                            #pragma omp atomic update
+                            delta[j] += valor;
+                        }
+                        trocaGrupo(i, grupos, delta, corte);
+                       
+                    }
                 }
-                trocaGrupo(i, grupos, delta, corte);
-            
-                if(corte > melhorCorte) melhorCorte = corte, melhorGrupos = grupos;     
-            }
 
-            //agora = steady_clock::now();
-            // now = duration_cast<duration<double>>(agora - inicio).count();
-            // now = (clock() - t) / CLOCKS_PER_SEC;
-            // if (now >= tempo) break;
+                #pragma omp single
+                { 
+                    int corteCandidato = corte;
+
+                    for (int t = 0; t < numThreads; t++) { 
+                        for (int i : negativosPorThread[t]) 
+                            corteCandidato += delta[i]; 
+                    }
+
+                    if (corteCandidato > melhorCorte) {
+                        melhorCorte = corteCandidato;
+                        melhorGrupos = grupos;
+
+                        for (int t = 0; t < numThreads; t++) {
+                            for (int i : negativosPorThread[t])
+                                melhorGrupos[i] ^= 1;
+                        }
+                    }
+
+                    for (int t = 0; t < numThreads; t++) negativosPorThread[t].clear();
+                }
         }
-        if ((s + 1) % 10 == 0) {
-        comunicacaoMPI(
-            rank,
-            processos,
-            fase,
-            matriz,
-            n,
-            grupos,
-            delta,
-            corte,
-            melhorCorte,
-            melhorGrupos,
-            T,
-            temperaturas
-        );
 
-    fase = 1 - fase;
-}
+            #pragma omp master
+            {
+                s++; 
+                
+                if (s % 10 == 0) {
+                    trocaTemperatura(processos, fase, idxTemperatura, T, corte, temperaturas, tentativas, aceitas, rng);
+                    fase = 1 - fase;
+                
+
+                    if (rank == 0) { 
+                        auto agora = steady_clock::now();
+                        double now = duration_cast<duration<double>>(agora - inicio).count();
+                        if (now >= LIMITE_TEMPO) continuar = 0;
+                    }
+
+                    MPI_Bcast(&continuar, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                }
+            }
+                #pragma omp barrier
+        }
     }
-
-cout << "Rank " << rank
-     << " | Melhor corte local: " << melhorCorte
-     << endl;
 
     int melhorGlobal, melhorRank;
 
+    // seleciona melhor corte e distribui para cada oricessi
     MPI_Allreduce(&melhorCorte, &melhorGlobal, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 
+    // identifica o rank vendo se eu achei o corte ou não
     int candidato = (melhorCorte == melhorGlobal) ? rank : processos;
 
+    // acho o candidato com menor rank que tem o melhor corte
     MPI_Reduce(&candidato, &melhorRank, 1, MPI_INT, MPI_MIN, 0, MPI_COMM_WORLD);
     MPI_Bcast(&melhorRank, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    if (rank == 0) {
-        cout << "Melhor corte global: " << melhorGlobal << endl;
-        cout << "Rank vencedor: " << melhorRank << endl;
-    }
+    if (rank != 0 and rank == melhorRank) MPI_Send(melhorGrupos.data(), n + 1, MPI_INT, 0, 10, MPI_COMM_WORLD);
 
-    if (rank == melhorRank and rank != 0) 
-        MPI_Send(melhorGrupos.data(), n + 1, MPI_INT, 0, 10, MPI_COMM_WORLD);
-
-    if (rank == 0 and melhorRank != 0) 
-        MPI_Recv(melhorGrupos.data(), n + 1, MPI_INT, melhorRank, 10, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
+    if (rank == 0 and melhorRank != 0) MPI_Recv(melhorGrupos.data(), n + 1, MPI_INT, melhorRank, 10, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    
     if (rank == 0) { 
         string resultado;
         for(int i = 1; i <= n; i++) resultado += (melhorGrupos[i] + '0');
 
         gravarResultado(arquivoSaida, resultado);
 
-       // cout << "Divisão dos grupos foi: " << resultado << endl;
-        //cout << "Valor do corte foi: " << melhorCorte << endl;
+        cout << "Valor do corte foi: " << melhorGlobal << endl;
     }
+
     MPI_Finalize();
 
     return 0;
