@@ -50,7 +50,7 @@ void gravarResultado(string arquivoSaida, string resultado) {
     else cout << "Não foi possível abrir o arquivo." << endl;
 }
 
-void trocaTemperatura (int processos, int fase, int& idxTemperatura, double& T, int corte, const vector<double>&temperaturas, long long& tentativas, long long& aceitas, mt19937& rng) { 
+void trocaTemperatura (int processos, int fase, int& idxTemperatura, double& T, int corte, const vector<double>&temperaturas, mt19937& rng) { 
 
     vector<int> indices(processos);
 
@@ -93,9 +93,6 @@ void trocaTemperatura (int processos, int fase, int& idxTemperatura, double& T, 
         uniform_real_distribution<double> dist(0.0, 1.0);
 
         decisao = (dist(rng) < probabilidade);
-
-        tentativas++;
-        if (decisao) aceitas++;
     }
 
     int decisaoRecebida = 0;
@@ -163,19 +160,28 @@ int main (int argc, char* argv[]) {
 
     uint64_t seed = 0; 
 
-    random_device rd; 
-    seed = ((uint64_t) rd() << 32) ^ rd(); 
-    seed ^= (uint64_t)steady_clock::now().time_since_epoch().count();
+    if (rank == 0) {
+        random_device rd;
+        seed = ((uint64_t)rd() << 32) ^ rd();
+        seed ^= (uint64_t)steady_clock::now().time_since_epoch().count();
+    }
 
 
     MPI_Bcast(&seed, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
 
-    vector<double> temperaturas = {0.40, 0.70, 1.00, 1.61};
+    double Tmin = 0.40; 
+    double Tmax = 1.61;
+    vector<double> temperaturas(processos);
     
+    for (int i  = 0; i < processos; i++) { 
+        double proporcao = (double) i / (processos - 1);
+        
+        temperaturas[i] = Tmin * pow(Tmax / Tmin, proporcao);
+    }
+
+
     int idxTemperatura = rank; 
     double T = temperaturas[idxTemperatura];
-
-    long long tentativas = 0, aceitas = 0;
     
     mt19937 rng = criarGerador(seed, rank, 0);
 
@@ -192,28 +198,42 @@ int main (int argc, char* argv[]) {
     string arquivoEntrada = argv[1];
     string arquivoSaida = argv[2];
 
-    ifstream arquivo(arquivoEntrada);
-    if (!arquivo.is_open()) {
+    FILE* arquivo = fopen(arquivoEntrada.c_str(), "r");
+    
+    if (arquivo == nullptr) {
         cout << "Não foi possível abrir o arquivo de entrada." << endl;
        
         MPI_Finalize();
         return 1;
     }
 
-    cin.tie(0)->sync_with_stdio(0);
 
     // aqui a gente inicializa e popula a matriz de adjacencia do grafo
-    int n, m; arquivo >> n >> m;
+    int n, m; 
+    if (fscanf(arquivo, "%d %d", &n, &m) != 2) {
+        cerr << "Erro ao ler n e m." << endl;
+        fclose(arquivo);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    
+    }    
     vector<vector<p>> matriz(n + 1);
 
     int u, v, x;
   
     for (int j = 0; j < m; j++) {
-        arquivo >> u >> v >> x;
+        if (fscanf(arquivo, "%d %d %d", &u, &v, &x) != 3) {
+            cerr << "Erro ao ler aresta." << endl;
+            fclose(arquivo);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
         matriz[u].emplace_back(v,x);
         matriz[v].emplace_back(u,x);
     }
-    arquivo.close();
+    fclose(arquivo);
+
+    int grauMax = 0;
+    for (int i = 1; i <= n; i++) grauMax = max(grauMax, (int)matriz[i].size());
+    vector<double> tabelaExp(grauMax + 1);
 
     vector<vector<int>> cores = colorirGrafo(matriz, n);
 
@@ -238,17 +258,24 @@ int main (int argc, char* argv[]) {
     // inicializa thread
     int numThreads = omp_get_max_threads();
 
-    vector<vector<int>> negativosPorThread(numThreads); 
     vector<mt19937> geradores(numThreads);
 
     for (int i = 0; i < numThreads; i++) geradores[i] = criarGerador(seed, rank, 2, i);
 
     int fase = 0, s = 0, continuar = 1;
-    
+    double temperaturaTabela = -1.0;
     // annealing 
+
     #pragma omp parallel
     { 
-        while (continuar) {        
+        while (continuar) {   
+            #pragma omp single
+            {
+                if (temperaturaTabela != T) 
+                    for (int k = 0; k <= grauMax; k++) tabelaExp[k] = exp(-k / T);
+            
+                temperaturaTabela = T;
+            }    
             int tid = omp_get_thread_num(); 
             uniform_real_distribution<double> dist(0.0, 1.0);
 
@@ -257,9 +284,7 @@ int main (int argc, char* argv[]) {
                 for (int k = 0; k < (int)cores[c].size(); k++) { 
                     int i = cores[c][k]; 
 
-                    if(delta[i] >= 0 or dist(geradores[tid]) < exp(delta[i] / T)) {
-                        if (delta[i] < 0) negativosPorThread[tid].push_back(i);
-                        
+                    if(delta[i] >= 0 or dist(geradores[tid]) < tabelaExp[-delta[i]]) {                        
                         for(auto v : matriz[i]) {
                             int j = v.first;
                             int peso = v.second;
@@ -275,36 +300,19 @@ int main (int argc, char* argv[]) {
                        
                     }
                 }
+            }
 
-                #pragma omp single
-                { 
-                    int corteCandidato = corte;
-
-                    for (int t = 0; t < numThreads; t++) { 
-                        for (int i : negativosPorThread[t]) 
-                            corteCandidato += delta[i]; 
-                    }
-
-                    if (corteCandidato > melhorCorte) {
-                        melhorCorte = corteCandidato;
-                        melhorGrupos = grupos;
-
-                        for (int t = 0; t < numThreads; t++) {
-                            for (int i : negativosPorThread[t])
-                                melhorGrupos[i] ^= 1;
-                        }
-                    }
-
-                    for (int t = 0; t < numThreads; t++) negativosPorThread[t].clear();
-                }
-        }
+            #pragma omp single
+            {
+                if (corte > melhorCorte) melhorCorte = corte, melhorGrupos = grupos;
+            }
 
             #pragma omp master
             {
                 s++; 
                 
                 if (s % 10 == 0) {
-                    trocaTemperatura(processos, fase, idxTemperatura, T, corte, temperaturas, tentativas, aceitas, rng);
+                    trocaTemperatura(processos, fase, idxTemperatura, T, corte, temperaturas, rng);
                     fase = 1 - fase;
                 
 
@@ -314,6 +322,7 @@ int main (int argc, char* argv[]) {
                         if (now >= LIMITE_TEMPO) continuar = 0;
                     }
 
+    
                     MPI_Bcast(&continuar, 1, MPI_INT, 0, MPI_COMM_WORLD);
                 }
             }
