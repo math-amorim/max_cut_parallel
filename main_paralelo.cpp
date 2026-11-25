@@ -6,7 +6,11 @@ using namespace std;
 using namespace chrono;
 #define p pair<int,int> 
 
-double LIMITE_TEMPO = 85.0;
+double Tmin = 0.30;
+double Tmax = 1.00;
+double G0   = 4.0;
+double G1   = 1.0;
+double LIMITE_TEMPO = 83.5;
 
 int calculoValorCorte (vector<vector<p>>&matriz, vector<int>&grupos, int n) { 
     int corte = 0;
@@ -31,14 +35,11 @@ int calcularDelta (vector<vector<p>>&matriz, vector<int>&grupos, int i) {
 }
 
 void trocaGrupo(int i, vector<int>& grupos, vector<int>& delta, int& corte) {    
-    // adiciono o ganho ou a perda ao meu corte
     #pragma omp atomic update
     corte += delta[i];
 
-    // inverto o grupo 
     grupos[i] ^= 1; 
 
-    // e ai indico que agora realizar a inversão novamente vai acrescentar ou subtrair o valor de delta novamente
     delta[i] = -delta[i];
 
 }
@@ -50,8 +51,7 @@ void gravarResultado(string arquivoSaida, string resultado) {
     else cout << "Não foi possível abrir o arquivo." << endl;
 }
 
-void trocaTemperatura (int processos, int fase, int& idxTemperatura, double& T, int corte, const vector<double>&temperaturas, mt19937& rng) { 
-
+void trocaTemperatura (int processos, int fase, int& idxTemperatura, double& T, int corte, const vector<double>&temperaturas, mt19937& rng, double g) { 
     vector<int> indices(processos);
 
     MPI_Allgather(&idxTemperatura, 1, MPI_INT, indices.data(), 1, MPI_INT, MPI_COMM_WORLD);
@@ -83,8 +83,8 @@ void trocaTemperatura (int processos, int fase, int& idxTemperatura, double& T, 
     int decisao = 0;
 
     if (idxTemperatura < idxVizinhoRecebido) { 
-        double TA = temperaturas[idxTemperatura];
-        double TB = temperaturas[idxVizinho];
+        double TA = temperaturas[idxTemperatura] * g;
+        double TB = temperaturas[idxVizinho] * g;
 
         double expoente = (1.0 / TA - 1.0 / TB) * (corteVizinho - corte);
 
@@ -166,23 +166,21 @@ int main (int argc, char* argv[]) {
         seed ^= (uint64_t)steady_clock::now().time_since_epoch().count();
     }
 
-
     MPI_Bcast(&seed, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
 
-    double Tmin = 0.40; 
-    double Tmax = 1.61;
     vector<double> temperaturas(processos);
     
     for (int i  = 0; i < processos; i++) { 
-        double proporcao = (double) i / (processos - 1);
+        double proporcao = (processos > 1) ? (double)i / (processos - 1) : 0.0;        
         
         temperaturas[i] = Tmin * pow(Tmax / Tmin, proporcao);
     }
 
-
     int idxTemperatura = rank; 
     double T = temperaturas[idxTemperatura];
     
+    double g = G0;
+
     mt19937 rng = criarGerador(seed, rank, 0);
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -203,19 +201,17 @@ int main (int argc, char* argv[]) {
     if (arquivo == nullptr) {
         cout << "Não foi possível abrir o arquivo de entrada." << endl;
        
-        MPI_Finalize();
-        return 1;
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-
-    // aqui a gente inicializa e popula a matriz de adjacencia do grafo
     int n, m; 
     if (fscanf(arquivo, "%d %d", &n, &m) != 2) {
         cerr << "Erro ao ler n e m." << endl;
         fclose(arquivo);
         MPI_Abort(MPI_COMM_WORLD, 1);
     
-    }    
+    }
+
     vector<vector<p>> matriz(n + 1);
 
     int u, v, x;
@@ -233,6 +229,7 @@ int main (int argc, char* argv[]) {
 
     int grauMax = 0;
     for (int i = 1; i <= n; i++) grauMax = max(grauMax, (int)matriz[i].size());
+    
     vector<double> tabelaExp(grauMax + 1);
 
     vector<vector<int>> cores = colorirGrafo(matriz, n);
@@ -241,21 +238,17 @@ int main (int argc, char* argv[]) {
 
     uniform_int_distribution<int> distGrupo(0,1);
 
-    // aqui a gente separa em grupos aleatorios 
     vector<int> grupos(n+1);
     for(int i = 0; i < n + 1; i++) grupos[i] = distGrupo(rngGrupos);
     
-    // aq calcula o valor do corte inicial   
     int corte = calculoValorCorte(matriz, grupos, n);  
 
     int melhorCorte = corte;
     vector<int> melhorGrupos = grupos; 
 
-    // aq calcula o delta de cada vertice 
     vector<int> delta(n + 1);
     for(int i = 1; i <= n; i++) delta[i] = calcularDelta(matriz, grupos, i);
 
-    // inicializa thread
     int numThreads = omp_get_max_threads();
 
     vector<mt19937> geradores(numThreads);
@@ -264,17 +257,17 @@ int main (int argc, char* argv[]) {
 
     int fase = 0, s = 0, continuar = 1;
     double temperaturaTabela = -1.0;
-    // annealing 
 
     #pragma omp parallel
     { 
         while (continuar) {   
             #pragma omp single
             {
-                if (temperaturaTabela != T) 
-                    for (int k = 0; k <= grauMax; k++) tabelaExp[k] = exp(-k / T);
+                double Tuso = T * g;
+                if (temperaturaTabela != Tuso) 
+                    for (int k = 0; k <= grauMax; k++) tabelaExp[k] = exp(-k / Tuso);
             
-                temperaturaTabela = T;
+                temperaturaTabela = Tuso;
             }    
             int tid = omp_get_thread_num(); 
             uniform_real_distribution<double> dist(0.0, 1.0);
@@ -312,18 +305,27 @@ int main (int argc, char* argv[]) {
                 s++; 
                 
                 if (s % 10 == 0) {
-                    trocaTemperatura(processos, fase, idxTemperatura, T, corte, temperaturas, rng);
+                    trocaTemperatura(processos, fase, idxTemperatura, T, corte, temperaturas, rng, g);
+                    
                     fase = 1 - fase;
-                
+                    
+                    double flags[2] = {1.0, g};
 
                     if (rank == 0) { 
-                        auto agora = steady_clock::now();
-                        double now = duration_cast<duration<double>>(agora - inicio).count();
-                        if (now >= LIMITE_TEMPO) continuar = 0;
+                        double now = duration_cast<duration<double>>(steady_clock::now() - inicio).count();
+                        
+                        if (now >= LIMITE_TEMPO) flags[0] = 0;
+
+                        double frac = min(1.0, now / LIMITE_TEMPO); 
+                        
+                        flags[1] = G0 * pow (G1 / G0, frac);
                     }
 
     
-                    MPI_Bcast(&continuar, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                    MPI_Bcast(flags, 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+                    continuar = flags[0];
+                    g = flags[1];
                 }
             }
                 #pragma omp barrier
@@ -332,13 +334,10 @@ int main (int argc, char* argv[]) {
 
     int melhorGlobal, melhorRank;
 
-    // seleciona melhor corte e distribui para cada oricessi
     MPI_Allreduce(&melhorCorte, &melhorGlobal, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 
-    // identifica o rank vendo se eu achei o corte ou não
     int candidato = (melhorCorte == melhorGlobal) ? rank : processos;
 
-    // acho o candidato com menor rank que tem o melhor corte
     MPI_Reduce(&candidato, &melhorRank, 1, MPI_INT, MPI_MIN, 0, MPI_COMM_WORLD);
     MPI_Bcast(&melhorRank, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
